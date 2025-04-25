@@ -1,0 +1,115 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Deploy org-wide SG rule scanner Lambda with cross-account role access
+
+Parameters:
+  S3BucketName:
+    Type: String
+    Description: S3 bucket to store security group scan CSV reports and Lambda code ZIP
+
+  SNSTopicEmail:
+    Type: String
+    Description: Email address for security group alert notifications
+
+  OrgCrossAccountRoleName:
+    Type: String
+    Default: OrgReadOnlyAccess
+    Description: IAM Role name in member accounts to assume for read-only scanning
+
+Resources:
+
+  SGAlertFunctionRole:
+    Type: AWS::IAM::Role
+    Description: IAM role that allows Lambda to access EC2, S3, SNS, logs, and assume cross-account roles
+    Properties:
+      RoleName: open-sg-lambda-role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: LambdaAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - organizations:ListAccounts
+                  - sts:AssumeRole
+                  - ec2:DescribeRegions
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                Resource: !Sub arn:aws:s3:::${S3BucketName}/open_sg_reports/*
+              - Effect: Allow
+                Action: sns:Publish
+                Resource: !Ref SGAlertTopic
+              - Effect: Allow
+                Action: logs:CreateLogGroup
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: "arn:aws:logs:*:*:*"
+
+  SGAlertTopic:
+    Type: AWS::SNS::Topic
+    Description: SNS topic for sending alert notifications for open SG rules
+    Properties:
+      TopicName: open-sg-alerts
+      Subscription:
+        - Endpoint: !Ref SNSTopicEmail
+          Protocol: email
+
+  SGAlertFunction:
+    Type: AWS::Lambda::Function
+    Description: Main Lambda function that scans security groups across AWS org
+    Properties:
+      FunctionName: org-check-open-sg
+      Runtime: python3.12
+      Timeout: 900
+      MemorySize: 256
+      Role: !GetAtt SGAlertFunctionRole.Arn
+      Handler: lambda_function.lambda_handler
+      Code:
+        S3Bucket: org-wide-open-sg-reports
+        S3Key: lambda_function.zip
+      Environment:
+        Variables:
+          S3_BUCKET: !Ref S3BucketName
+          SNS_TOPIC_ARN: !Ref SGAlertTopic
+          CROSS_ACCOUNT_ROLE: !Ref OrgCrossAccountRoleName
+
+  OrgScanScheduleRule:
+    Type: AWS::Events::Rule
+    Description: Daily EventBridge rule that triggers the Lambda scan
+    Properties:
+      Name: org-open-sg-daily
+      ScheduleExpression: rate(1 day)
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt SGAlertFunction.Arn
+          Id: LambdaTarget
+
+  AllowEventBridgeInvoke:
+    Type: AWS::Lambda::Permission
+    Description: Permission for EventBridge to trigger Lambda function
+    Properties:
+      FunctionName: !Ref SGAlertFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt OrgScanScheduleRule.Arn
+
+Outputs:
+  LambdaFunctionName:
+    Description: Name of the deployed Lambda function that runs the org-wide SG scanner
+    Value: !Ref SGAlertFunction
+
+  SNSAlertTopic:
+    Description: ARN of the SNS topic used for alerting
+    Value: !Ref SGAlertTopic
